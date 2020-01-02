@@ -19,7 +19,6 @@ import (
 	"configcenter/src/common/auth"
 	"configcenter/src/common/core/cc/config"
 	"configcenter/src/storage/dal/mongo"
-	"configcenter/src/thirdpartyclient/elasticsearch"
 )
 
 type ServerOption struct {
@@ -31,7 +30,8 @@ type Config struct {
 	Mongo                mongo.Config
 	ConfigMap            map[string]string
 	Auth                 authcenter.AuthConfig
-	Es                   elasticsearch.EsConfig
+	FullTextSearch       string `json:"es.full_text_search"`
+	EsUrl                string `json:"es.url"`
 }
 
 func NewServerOption() *ServerOption {
