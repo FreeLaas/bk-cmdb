@@ -439,7 +439,6 @@ func (assoc *association) UpdateAssociation(params types.ContextParams, data map
 
 	cond := condition.CreateCondition()
 	cond.Field(metadata.AssociationFieldAssociationId).Eq(assoID)
-	cond.Field(metadata.AssociationFieldSupplierAccount).Eq(params.SupplierAccount)
 
 	rsp, err := assoc.clientSet.CoreService().Association().ReadModelAssociation(context.Background(), params.Header, &metadata.QueryCondition{Condition: cond.ToMapStr()})
 	if nil != err {
@@ -508,16 +507,18 @@ func (assoc *association) CheckAssociation(params types.ContextParams, obj model
 	for _, asst := range asst {
 		var errCheck error
 		isInstExist := false
-		if asst.ObjectID == objectID {
+		if asst.ObjectID == objectID && asst.InstID == instID {
 			isInstExist, errCheck = assoc.CheckAssociationInstExist(params, asst.AsstObjectID, asst.AsstInstID)
-		} else {
+		} else if asst.AsstObjectID == objectID && asst.AsstInstID == instID {
 			isInstExist, errCheck = assoc.CheckAssociationInstExist(params, asst.ObjectID, asst.InstID)
+		} else {
+			return params.Err.New(common.CCErrCommDBSelectFailed, "instance is not associated in selected association")
 		}
 		if errCheck != nil {
 			return errCheck
 		}
 		if isInstExist {
-			return params.Err.Error(common.CCErrTopoInstHasBeenAssociation)
+			return params.Err.CCErrorf(common.CCErrTopoInstHasBeenAssociation, instID)
 		}
 	}
 
@@ -661,7 +662,6 @@ func (assoc *association) DeleteType(params types.ContextParams, asstTypeID int6
 	}
 	cond := condition.CreateCondition()
 	cond.Field("id").Eq(asstTypeID)
-	cond.Field(common.BKOwnerIDField).Eq(params.SupplierAccount)
 	query := &metadata.SearchAssociationTypeRequest{
 		Condition: cond.ToMapStr(),
 	}
