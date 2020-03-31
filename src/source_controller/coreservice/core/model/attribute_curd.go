@@ -95,31 +95,33 @@ func (m *modelAttribute) save(ctx core.ContextParams, attribute metadata.Attribu
 }
 
 func (m *modelAttribute) checkUnique(ctx core.ContextParams, isCreate bool, objID, propertyID, propertyName string, meta metadata.Metadata) error {
-	cond := mongo.NewCondition()
-	cond = cond.Element(mongo.Field(common.BKObjIDField).Eq(objID))
-
-	isExist, bizID := meta.Label.Get(common.BKAppIDField)
-	if isExist {
-		_, metaCond := cond.Embed(metadata.BKMetadata)
-		_, labelCond := metaCond.Embed(metadata.BKLabel)
-		labelCond.Element(&mongo.Eq{Key: common.BKAppIDField, Val: bizID})
+	cond := map[string]interface{}{
+		common.BKObjIDField: objID,
 	}
+	orCond := make([]map[string]interface{}, 0)
 
-	nameFieldCond := mongo.Field(common.BKPropertyNameField).Eq(propertyName)
 	if isCreate {
-		idFieldCond := mongo.Field(common.BKPropertyIDField).Eq(propertyID)
-		cond = cond.Or(nameFieldCond, idFieldCond)
+		nameFieldCond := map[string]interface{}{common.BKPropertyNameField: propertyName}
+		idFieldCond := map[string]interface{}{common.BKPropertyIDField: propertyID}
+		orCond = append(orCond, nameFieldCond, idFieldCond)
 	} else {
 		// update attribute. not change name, 无需判断
 		if propertyName == "" {
 			return nil
 		}
-
-		idFieldCond := mongo.Field(common.BKPropertyIDField).Neq(propertyID)
-		cond = cond.Element(nameFieldCond, idFieldCond)
+		cond[common.BKPropertyIDField] = map[string]interface{}{common.BKDBNE: propertyID}
+		cond[common.BKPropertyNameField] = propertyName
 	}
 
-	condMap := util.SetModOwner(cond.ToMapStr(), ctx.SupplierAccount)
+	isExist, bizID := meta.Label.Get(common.BKAppIDField)
+	if isExist {
+		orCond = append(orCond, metadata.BizLabelNotExist, map[string]interface{}{metadata.MetadataBizField: bizID})
+	}
+
+	if len(orCond) > 0 {
+		cond[common.BKDBOR] = orCond
+	}
+	condMap := util.SetModOwner(cond, ctx.SupplierAccount)
 
 	resultAttrs := make([]metadata.Attribute, 0)
 	err := m.dbProxy.Table(common.BKTableNameObjAttDes).Find(condMap).All(ctx, &resultAttrs)
@@ -180,7 +182,7 @@ func (m *modelAttribute) checkAttributeValidity(ctx core.ContextParams, attribut
 		attribute.Placeholder = strings.TrimSpace(attribute.Placeholder)
 		match, err := regexp.MatchString(common.FieldTypeLongCharRegexp, attribute.Placeholder)
 		if nil != err || !match {
-			return ctx.Error.Errorf(common.CCErrCommParamsIsInvalid, metadata.AttributeFieldPlaceHoler)
+			return ctx.Error.Errorf(common.CCErrCommParamsIsInvalid, metadata.AttributeFieldPlaceHolder)
 		}
 	}
 
@@ -561,12 +563,16 @@ func (m *modelAttribute) checkUpdate(ctx core.ContextParams, data mapstr.MapStr,
 		}
 	}
 
-	// 预定义字段，只能更新分组和分组内排序
+	// 预定义字段，只能更新分组、分组内排序、名称、单位、提示语和option
 	if hasIsPreProperty {
 		hasNotAllowField := false
 		_ = data.ForEach(func(key string, val interface{}) error {
 			if key != metadata.AttributeFieldPropertyGroup &&
-				key != metadata.AttributeFieldPropertyIndex {
+				key != metadata.AttributeFieldPropertyIndex &&
+				key != metadata.AttributeFieldPropertyName &&
+				key != metadata.AttributeFieldUnit &&
+				key != metadata.AttributeFieldPlaceHolder &&
+				key != metadata.AttributeFieldOption {
 				hasNotAllowField = true
 			}
 			return nil
@@ -578,16 +584,54 @@ func (m *modelAttribute) checkUpdate(ctx core.ContextParams, data mapstr.MapStr,
 		}
 	}
 
+	if option, exists := data.Get(metadata.AttributeFieldOption); exists {
+		propertyType := dbAttributeArr[0].PropertyType
+		for _, dbAttribute := range dbAttributeArr {
+			if dbAttribute.PropertyType != propertyType {
+				blog.ErrorJSON("update option, but property type not the same, db attributes: %s, rid:%s", dbAttributeArr, ctx.ReqID)
+				return changeRow, ctx.Error.Errorf(common.CCErrCommParamsInvalid, "cond")
+			}
+		}
+		if err := util.ValidPropertyOption(propertyType, option, ctx.Error); err != nil {
+			blog.ErrorJSON("valid property option failed, err: %s, data: %s, rid:%s", err, data, ctx.ReqID)
+			return changeRow, err
+		}
+	}
+
 	// 删除不可更新字段， 避免由于传入数据，修改字段
 	// TODO: 改成白名单方式
 	data.Remove(metadata.AttributeFieldPropertyID)
 	data.Remove(metadata.AttributeFieldSupplierAccount)
 	data.Remove(metadata.AttributeFieldPropertyType)
 	data.Remove(metadata.AttributeFieldCreateTime)
+	data.Remove(metadata.AttributeFieldIsPre)
 	data.Set(metadata.AttributeFieldLastTime, time.Now())
 
-	if grp, exists := data.Get(metadata.AttributeFieldPropertyGroup); exists && (grp == "") {
-		data.Remove(metadata.AttributeFieldPropertyGroup)
+	if grp, exists := data.Get(metadata.AttributeFieldPropertyGroup); exists {
+		if grp == "" {
+			data.Remove(metadata.AttributeFieldPropertyGroup)
+		}
+		// check if property group exists in object
+		objIDs := make([]string, 0)
+		for _, dbAttribute := range dbAttributeArr {
+			objIDs = append(objIDs, dbAttribute.ObjectID)
+		}
+		objIDs = util.StrArrayUnique(objIDs)
+		cond := map[string]interface{}{
+			common.BKObjIDField: map[string]interface{}{
+				common.BKDBIN: objIDs,
+			},
+			common.BKPropertyGroupIDField: grp,
+		}
+		cnt, err := m.dbProxy.Table(common.BKTableNamePropertyGroup).Find(cond).Count(ctx)
+		if err != nil {
+			blog.ErrorJSON("property group count failed, err: %s, condition: %s, rid: %s", err, cond, ctx.ReqID)
+			return changeRow, err
+		}
+		if cnt != uint64(len(objIDs)) {
+			blog.Errorf("property group invalid, objIDs: %s have %d property groups, rid: %s", objIDs, cnt, ctx.ReqID)
+			return changeRow, ctx.Error.Errorf(common.CCErrCommParamsInvalid, metadata.AttributeFieldPropertyGroup)
+		}
 	}
 
 	attribute := metadata.Attribute{}
